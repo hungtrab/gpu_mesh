@@ -94,6 +94,12 @@ class ModelSpec:
     # frozen base weights are fp16/bf16.  A separate field prevents the
     # planner from under-counting resident, gradient and optimizer memory.
     adapter_dtype_bytes: int = 4
+    # Optional breakdown for recipes with ``modules_to_save``.  Endpoint
+    # weights belong to stage 0 / the final stage; they must not be smeared
+    # proportionally across decoder layers.
+    adapter_layer_param_count: int | None = None
+    adapter_embedding_param_count: int = 0
+    adapter_lm_head_param_count: int = 0
 
     def __post_init__(self) -> None:
         for name in (
@@ -108,6 +114,8 @@ class ModelSpec:
             "dtype_bytes",
             "adapter_param_count",
             "adapter_dtype_bytes",
+            "adapter_embedding_param_count",
+            "adapter_lm_head_param_count",
         ):
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, int):
@@ -129,13 +137,19 @@ class ModelSpec:
             raise ValueError("num_attention_heads must be divisible by num_kv_heads")
         if self.num_kv_heads > self.num_attention_heads:
             raise ValueError("num_kv_heads must not exceed num_attention_heads")
-        for name in ("param_count", "adapter_param_count"):
+        for name in (
+            "param_count",
+            "adapter_param_count",
+            "adapter_embedding_param_count",
+            "adapter_lm_head_param_count",
+        ):
             if getattr(self, name) < 0:
                 raise ValueError(f"{name} must be non-negative")
         for name in (
             "per_layer_param_count",
             "embedding_param_count",
             "lm_head_param_count",
+            "adapter_layer_param_count",
         ):
             value = getattr(self, name)
             if value is not None:
@@ -143,6 +157,16 @@ class ModelSpec:
                     raise TypeError(f"{name} must be an integer or None")
                 if value < 0:
                     raise ValueError(f"{name} must be non-negative")
+        if self.adapter_layer_param_count is not None:
+            accounted_adapters = (
+                self.adapter_layer_param_count
+                + self.adapter_embedding_param_count
+                + self.adapter_lm_head_param_count
+            )
+            if accounted_adapters != self.adapter_param_count:
+                raise ValueError(
+                    "adapter parameter breakdown must equal adapter_param_count"
+                )
         if self.attention_implementation not in {
             "eager",
             "sdpa",
@@ -152,6 +176,8 @@ class ModelSpec:
                 "attention_implementation must be one of 'eager', 'sdpa', "
                 "or 'flash_attention_2'"
             )
+        if self.adapter_dtype_bytes < 1:
+            raise ValueError("adapter_dtype_bytes must be positive")
         if self.max_position_embeddings is not None:
             if (
                 isinstance(self.max_position_embeddings, bool)
@@ -160,8 +186,6 @@ class ModelSpec:
                 raise TypeError("max_position_embeddings must be an integer or None")
             if self.max_position_embeddings < 1:
                 raise ValueError("max_position_embeddings must be positive")
-        if self.adapter_dtype_bytes < 1:
-            raise ValueError("adapter_dtype_bytes must be positive")
 
 
 @dataclass
@@ -768,6 +792,11 @@ def _training_peak(
 ) -> TensorPeak:
     base_params = _base_layer_params(model, layer_count, is_first, is_last)
     adapter_params = _adapter_params_for_layers(model, layer_count)
+    if model.adapter_param_count:
+        if is_first:
+            adapter_params += model.adapter_embedding_param_count
+        if is_last:
+            adapter_params += model.adapter_lm_head_param_count
     weight_bytes = estimate_weight_bytes(base_params, model.dtype_bytes)
     adapter_bytes = estimate_weight_bytes(adapter_params, model.adapter_dtype_bytes)
     # With an adapter present, base weights are resident but frozen.  Only the
@@ -879,17 +908,19 @@ def _trainable_layer_params(
     Full fine-tuning updates endpoint modules too: the first stage owns the
     embedding table and the last stage owns the final norm/lm head.  The old
     estimate counted only decoder blocks, which understated gradient and Adam
-    state on both endpoint stages.  LoRA remains layer-only because the built
-    in recipe injects adapters into attention projections.
+    state on both endpoint stages.  LoRA layer adapters follow decoder
+    ownership, while explicitly saved endpoint modules stay on their owner.
     """
     if model.adapter_param_count:
-        # ``adapter_param_count`` is the complete-model count as obtained from
-        # a manifest.  Distribute it by contiguous layer ownership; endpoint
-        # modules currently do not carry LoRA adapters.
-        # Round up: an under-estimate can admit a request that OOMs.  The
-        # complete-model count is not necessarily divisible by the number of
-        # layers, so conservative ownership beats integer truncation here.
-        return math.ceil(model.adapter_param_count * n_layers / max(model.num_layers, 1))
+        # Layer adapters are distributed with the decoder blocks.  Full
+        # ``modules_to_save`` endpoints are charged to the stage that owns
+        # them, rather than being hidden in a proportional layer average.
+        total = _adapter_params_for_layers(model, n_layers)
+        if is_first:
+            total += model.adapter_embedding_param_count
+        if is_last:
+            total += model.adapter_lm_head_param_count
+        return total
     return _layer_params(model, n_layers, is_first=is_first, is_last=is_last)
 
 
@@ -935,9 +966,14 @@ def _base_layer_params(
 
 
 def _adapter_params_for_layers(model: ModelSpec, n_layers: int) -> int:
-    """Conservatively assign complete-model adapters to a stage's layers."""
+    """Conservatively assign decoder-layer adapters to a stage."""
     if model.adapter_param_count == 0:
         return 0
     if isinstance(n_layers, bool) or not isinstance(n_layers, int) or n_layers < 1:
         raise ValueError("n_layers must be a positive integer")
-    return math.ceil(model.adapter_param_count * n_layers / max(model.num_layers, 1))
+    source = model.adapter_layer_param_count
+    if source is None:
+        # Backwards-compatible fallback for hand-built ModelSpec values that
+        # only provide the historical complete-model adapter count.
+        source = model.adapter_param_count
+    return math.ceil(source * n_layers / max(model.num_layers, 1))

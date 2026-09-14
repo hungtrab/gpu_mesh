@@ -243,3 +243,13 @@ def test_lora_merge_correctness():
         lora_linear.lora_B @ lora_linear.lora_A
     ) * lora_linear.scale
     torch.testing.assert_close(merged.weight.data, expected, atol=1e-5, rtol=1e-5)
+
+
+def test_lora_state_dict_rejects_frozen_or_unknown_keys():
+    stage = _make_stage()
+    apply_lora(stage, LoRAConfig(rank=2, alpha=4.0))
+    state = lora_state_dict(stage)
+    state["layers.0.self_attn.q_proj.base.weight"] = torch.zeros(32, 32)
+
+    with pytest.raises(ValueError, match="unknown keys"):
+        load_lora_state_dict(stage, state)

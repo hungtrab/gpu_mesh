@@ -912,6 +912,257 @@ def remote_serve(
         raise click.ClickException(f"remote inference gateway failed: {exc}") from exc
 
 
+@cli.command("remote-ttt")
+@click.option(
+    "--manifest",
+    "manifest_dir",
+    required=True,
+    type=click.Path(exists=True, file_okay=False, path_type=Path),
+    help="Artifact directory containing manifest.json and model metadata.",
+)
+@click.option(
+    "--stage-url",
+    "stage_urls",
+    multiple=True,
+    required=True,
+    help="Stage RPC/relay URL in layer order; repeat once per stage.",
+)
+@click.option(
+    "--credential",
+    "stage_credentials",
+    multiple=True,
+    required=True,
+    envvar="MESHGPU_STAGE_CREDENTIAL",
+    hide_input=True,
+    help="Stage credential; one value is reused for all stages, or repeat per stage.",
+)
+@click.option(
+    "--relay-token",
+    default=None,
+    envvar="MESHGPU_RELAY_TOKEN",
+    hide_input=True,
+    help="Relay admission token when --stage-url points at WebSocketRelay.",
+)
+@click.option(
+    "--stage-worker-incarnation",
+    "stage_worker_incarnations",
+    multiple=True,
+    required=True,
+    type=click.IntRange(0, 0xFFFFFFFF),
+    help="Remote worker incarnation; repeat exactly once per stage.",
+)
+@click.option("--client-incarnation", required=True, type=click.IntRange(0, 0xFFFFFFFF))
+@click.option("--cluster-id", required=True, type=click.IntRange(0, 65535))
+@click.option("--job-id", required=True, type=click.IntRange(0, 0xFFFFFFFF))
+@click.option("--lease-epoch", required=True, type=click.IntRange(0, 0xFFFFFFFF))
+@click.option(
+    "--batch",
+    "batch_path",
+    required=True,
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    help="JSON object with input_ids and optional labels arrays.",
+)
+@click.option("--steps", default=1, show_default=True, type=click.IntRange(min=1))
+@click.option("--lr", default=1e-4, show_default=True, type=float)
+@click.option("--weight-decay", default=0.0, show_default=True, type=float)
+@click.option("--max-grad-norm", default=1.0, show_default=True, type=float)
+@click.option("--lora-rank", default=256, show_default=True, type=click.IntRange(min=1))
+@click.option("--lora-alpha", default=32.0, show_default=True, type=float)
+@click.option(
+    "--lora-target-modules",
+    default="q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj",
+    show_default=True,
+    help="Comma-separated projection leaf names.",
+)
+@click.option(
+    "--modules-to-save",
+    default="embed_tokens,lm_head",
+    show_default=True,
+    help="Comma-separated full modules kept trainable (NVARC defaults to endpoints).",
+)
+@click.option("--lora-dropout", default=0.0, show_default=True, type=float)
+@click.option("--rslora/--no-rslora", default=True, show_default=True)
+@click.option(
+    "--activation-checkpointing/--no-activation-checkpointing",
+    default=True,
+    show_default=True,
+    help="Recompute decoder blocks during backward to reduce stage VRAM.",
+)
+@click.option("--ignore-index", default=-100, show_default=True, type=int)
+@click.option(
+    "--tls-ca",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    help="CA bundle for wss:// stage endpoints.",
+)
+def remote_ttt(
+    manifest_dir: Path,
+    stage_urls: tuple[str, ...],
+    stage_credentials: tuple[str, ...],
+    relay_token: str | None,
+    stage_worker_incarnations: tuple[int, ...],
+    client_incarnation: int,
+    cluster_id: int,
+    job_id: int,
+    lease_epoch: int,
+    batch_path: Path,
+    steps: int,
+    lr: float,
+    weight_decay: float,
+    max_grad_norm: float,
+    lora_rank: int,
+    lora_alpha: float,
+    lora_target_modules: str,
+    modules_to_save: str,
+    lora_dropout: float,
+    rslora: bool,
+    activation_checkpointing: bool,
+    ignore_index: int,
+    tls_ca: Path | None,
+) -> None:
+    """Run one bounded LoRA TTT task through remote stage workers.
+
+    The gateway is intentionally one-shot: a caller can invoke this command
+    once per puzzle, and each invocation starts from the stage's configured
+    baseline.  For a long-lived application use ``RemoteTaskTTTSession`` and
+    call ``reset_task()`` between tasks.
+    """
+    import logging
+    import math
+
+    from meshgpu.artifacts.hf_import import validate_manifest_layout
+    from meshgpu.artifacts.manifest import ModelManifest
+    from meshgpu.backends.native.lora_recipe import LoRAConfig
+    from meshgpu.backends.portable.rpc import StageRpcIdentity, connect_stage_clients
+    from meshgpu.training.remote_ttt import RemoteTaskTTTSession
+    from meshgpu.training.ttt import TaskTTTConfig
+
+    try:
+        manifest = ModelManifest.load(manifest_dir / "manifest.json")
+        n_stages = len(validate_manifest_layout(manifest))
+        if len(stage_urls) != n_stages:
+            raise ValueError(
+                f"artifact has {n_stages} stages, got {len(stage_urls)} --stage-url values"
+            )
+        if manifest.meta.tied_embeddings:
+            raise ValueError(
+                "remote TTT does not support tied word embeddings; use an "
+                "untied artifact or local portable training"
+            )
+        credentials = _expand_stage_options(
+            stage_credentials,
+            n_stages,
+            "--credential",
+            repeat_single=True,
+        )
+        worker_incarnations = _expand_stage_options(
+            stage_worker_incarnations,
+            n_stages,
+            "--stage-worker-incarnation",
+            repeat_single=False,
+        )
+        target_modules = _csv_option(lora_target_modules, "--lora-target-modules")
+        saved_modules = _csv_option(modules_to_save, "--modules-to-save", allow_empty=True)
+        lora_cfg = LoRAConfig(
+            rank=lora_rank,
+            alpha=lora_alpha,
+            target_modules=target_modules,
+            dropout=lora_dropout,
+            use_rslora=rslora,
+            modules_to_save=saved_modules,
+        )
+        if not math.isfinite(lr) or lr <= 0:
+            raise ValueError("--lr must be finite and positive")
+        if not math.isfinite(weight_decay) or weight_decay < 0:
+            raise ValueError("--weight-decay must be finite and non-negative")
+        if not math.isfinite(max_grad_norm) or max_grad_norm <= 0:
+            raise ValueError("--max-grad-norm must be finite and positive")
+        input_ids, labels = _load_remote_ttt_batch(
+            batch_path,
+            vocab_size=manifest.meta.vocab_size,
+            max_position_embeddings=manifest.meta.max_position_embeddings,
+            ignore_index=ignore_index,
+        )
+        identities = [
+            StageRpcIdentity(
+                cluster_id=cluster_id,
+                job_id=job_id,
+                lease_epoch=lease_epoch,
+                worker_incarnation=client_incarnation,
+                peer_worker_incarnation=worker_incarnations[index],
+            )
+            for index in range(n_stages)
+        ]
+        ssl_context = _build_remote_ssl_context(stage_urls, tls_ca)
+    except (
+        FileNotFoundError,
+        KeyError,
+        OSError,
+        TypeError,
+        ValueError,
+        json.JSONDecodeError,
+    ) as exc:
+        raise click.ClickException(f"could not prepare remote TTT: {exc}") from exc
+
+    async def run_once() -> list[dict[str, object]]:
+        clients = await connect_stage_clients(
+            stage_urls,
+            credentials,
+            identities,
+            ssl_context=ssl_context,
+            relay_token=relay_token,
+            vocab_size=manifest.meta.vocab_size,
+            max_position_embeddings=manifest.meta.max_position_embeddings,
+            request_timeout_s=900.0,
+        )
+        session: RemoteTaskTTTSession | None = None
+        try:
+            session = RemoteTaskTTTSession(
+                clients,
+                TaskTTTConfig(
+                    lora=lora_cfg,
+                    learning_rate=lr,
+                    weight_decay=weight_decay,
+                    max_grad_norm=max_grad_norm,
+                    max_steps=steps,
+                    ignore_index=ignore_index,
+                    activation_checkpointing=activation_checkpointing,
+                ),
+            )
+            results = await session.adapt(input_ids, labels, steps=steps)
+            return [
+                {
+                    "step": result.step,
+                    "loss": result.loss,
+                    "grad_norm": result.grad_norm,
+                    "n_valid_tokens": result.n_valid_tokens,
+                    "overflow": result.overflow,
+                }
+                for result in results
+            ]
+        finally:
+            if session is not None:
+                # This command has no durable adapter output.  Always restore
+                # the stage baseline before closing so a later one-shot task
+                # cannot accidentally inherit this task's adaptation.  Users
+                # who need persistent task state should keep a
+                # RemoteTaskTTTSession alive and manage reset/checkpoint policy
+                # explicitly.
+                try:
+                    await session.reset_task()
+                except Exception:
+                    # Preserve the original task/connection error if one
+                    # exists, but make cleanup failure visible in the logs.
+                    logging.getLogger(__name__).exception(
+                        "could not reset remote TTT baseline before closing"
+                    )
+            await asyncio.gather(*(client.close() for client in clients), return_exceptions=True)
+
+    try:
+        click.echo(json.dumps(asyncio.run(run_once()), indent=2))
+    except (ConnectionError, OSError, RuntimeError, ValueError) as exc:
+        raise click.ClickException(f"remote TTT failed: {exc}") from exc
+
+
 def _expand_stage_options(
     values: tuple,
     n_stages: int,
@@ -929,6 +1180,47 @@ def _expand_stage_options(
             f"need {n_stages} values for {option_name}, got {len(items)}"
         )
     return items
+
+
+def _csv_option(value: str, option_name: str, *, allow_empty: bool = False) -> list[str]:
+    values = [item.strip() for item in value.split(",") if item.strip()]
+    if not values and not allow_empty:
+        raise ValueError(f"{option_name} must contain at least one name")
+    return list(dict.fromkeys(values))
+
+
+def _load_remote_ttt_batch(
+    path: Path,
+    *,
+    vocab_size: int,
+    max_position_embeddings: int,
+    ignore_index: int,
+):
+    """Load a small, explicit JSON batch without accepting pickle payloads."""
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise ValueError("remote TTT batch must be a JSON object")
+    if "input_ids" not in payload:
+        raise ValueError("remote TTT batch must contain input_ids")
+    import torch
+
+    input_ids = torch.tensor(payload["input_ids"], dtype=torch.long)
+    labels = torch.tensor(payload.get("labels", payload["input_ids"]), dtype=torch.long)
+    if input_ids.ndim != 2 or labels.shape != input_ids.shape:
+        raise ValueError("input_ids and labels must have the same shape [batch, sequence]")
+    if input_ids.shape[0] < 1 or input_ids.shape[1] < 1:
+        raise ValueError("remote TTT batch must be non-empty")
+    if int(input_ids.min()) < 0 or int(input_ids.max()) >= vocab_size:
+        raise ValueError("input_ids contain a token outside the manifest vocabulary")
+    invalid_labels = (labels != ignore_index) & ((labels < 0) | (labels >= vocab_size))
+    if bool(invalid_labels.any()):
+        raise ValueError("labels contain a token outside the manifest vocabulary")
+    if input_ids.shape[1] > max_position_embeddings:
+        raise ValueError(
+            f"batch sequence length {input_ids.shape[1]} exceeds model context "
+            f"{max_position_embeddings}"
+        )
+    return input_ids, labels
 
 
 def _build_remote_ssl_context(
@@ -1076,6 +1368,20 @@ def _parse_stage_devices(
 @click.option("--lr", default=2e-4, show_default=True, type=float)
 @click.option("--lora-rank", default=16, show_default=True, type=click.IntRange(min=1))
 @click.option("--lora-alpha", default=32.0, show_default=True, type=float)
+@click.option(
+    "--lora-target-modules",
+    default="q_proj,v_proj",
+    show_default=True,
+    help="Comma-separated projection leaf names.",
+)
+@click.option(
+    "--modules-to-save",
+    default="",
+    show_default=True,
+    help="Comma-separated full modules kept trainable, e.g. embed_tokens,lm_head.",
+)
+@click.option("--lora-dropout", default=0.0, show_default=True, type=float)
+@click.option("--rslora/--no-rslora", default=False, show_default=True)
 @click.option("--checkpoint-every", default=100, show_default=True,
               type=click.IntRange(min=1))
 @click.option(
@@ -1099,6 +1405,10 @@ def fine_tune(
     lr: float,
     lora_rank: int,
     lora_alpha: float,
+    lora_target_modules: str,
+    modules_to_save: str,
+    lora_dropout: float,
+    rslora: bool,
     checkpoint_every: int,
     resume_checkpoint: str | None,
     tokenizer_path: str | None,
@@ -1124,6 +1434,19 @@ def fine_tune(
         raise click.ClickException("--lr must be finite and positive")
     if not math.isfinite(lora_alpha) or lora_alpha <= 0:
         raise click.ClickException("--lora-alpha must be finite and positive")
+    try:
+        target_modules = _csv_option(lora_target_modules, "--lora-target-modules")
+        saved_modules = _csv_option(modules_to_save, "--modules-to-save", allow_empty=True)
+        lora_config = LoRAConfig(
+            rank=lora_rank,
+            alpha=lora_alpha,
+            target_modules=target_modules,
+            dropout=lora_dropout,
+            use_rslora=rslora,
+            modules_to_save=saved_modules,
+        )
+    except (TypeError, ValueError) as exc:
+        raise click.ClickException(f"invalid LoRA configuration: {exc}") from exc
     manifest_root = Path(manifest_dir)
     manifest = ModelManifest.load(manifest_root / "manifest.json")
     if manifest.meta.adapter == "qwen3_hf_v1":
@@ -1158,6 +1481,8 @@ def fine_tune(
                 activation_checkpointing=activation_checkpointing,
                 recipe=recipe,
                 lora_rank=lora_rank,
+                target_modules=tuple(target_modules),
+                modules_to_save=tuple(saved_modules),
             )
         except (OSError, RuntimeError, TypeError, ValueError) as exc:
             raise click.ClickException(
@@ -1183,7 +1508,7 @@ def fine_tune(
     )
     lora_cfg: LoRAConfig | None = None
     if recipe == "lora":
-        lora_cfg = LoRAConfig(rank=lora_rank, alpha=lora_alpha)
+        lora_cfg = lora_config
         for worker in workers:
             apply_lora(worker._model, lora_cfg)
 

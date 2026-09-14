@@ -1,4 +1,4 @@
-"""Inference RPC for a single portable pipeline stage.
+"""Inference and explicit training RPC for one portable pipeline stage.
 
 The local ``StageWorker`` API is synchronous because it is also used by the
 correctness reference.  This module provides an asynchronous equivalent for a
@@ -6,12 +6,11 @@ stage that lives in another process or machine:
 
 * control messages describe one operation and its tensor fields;
 * tensor fields travel through the authenticated, chunked ``DataConn``;
-* the server executes only the explicit ``forward_inference`` operation;
+* the server executes explicit inference and activation/gradient operations;
 * KV cache remains in the server-side stage worker.
 
-Training is intentionally not hidden behind this interface.  Backward needs an
-explicit activation/gradient protocol and checkpoint boundary; callers should
-use the portable in-process trainer until that contract is implemented.
+Training never tries to serialize an autograd graph.  The final stage creates
+the loss locally, and only detached hidden states/gradients cross the wire.
 """
 from __future__ import annotations
 
@@ -20,6 +19,7 @@ import hmac
 import logging
 import math
 import ssl
+import threading
 import uuid
 from collections.abc import Sequence
 from dataclasses import dataclass, field
@@ -27,7 +27,20 @@ from typing import Any
 
 import torch
 
-from meshgpu.backends.portable.stage_worker import ForwardResult, StageWorker
+from meshgpu.backends.native.lora_recipe import (
+    LoRAConfig,
+    apply_lora,
+    load_lora_state_dict,
+    lora_state_dict,
+    trainable_parameters,
+)
+from meshgpu.backends.portable.memory_guard import check_training_memory
+from meshgpu.backends.portable.stage_worker import (
+    BackwardResult,
+    ForwardResult,
+    StageWorker,
+    TrainForwardResult,
+)
 from meshgpu.protocol.schema import MAX_TENSOR_BYTES, DType, TensorMeta
 from meshgpu.transport.connection import MAX_WEBSOCKET_MESSAGE_BYTES, DataConn
 
@@ -36,12 +49,113 @@ log = logging.getLogger(__name__)
 _RPC_REQUEST = "stage_rpc_request"
 _RPC_RESPONSE = "stage_rpc_response"
 _RPC_ERROR = "stage_rpc_error"
-_ALLOWED_FIELDS = frozenset({"hidden", "input_ids", "position_ids", "attention_mask"})
+_ALLOWED_FIELDS = frozenset(
+    {
+        "hidden",
+        "input_ids",
+        "position_ids",
+        "attention_mask",
+        "labels",
+        "grad_output",
+    }
+)
+_INFERENCE_FIELDS = frozenset(
+    {"hidden", "input_ids", "position_ids", "attention_mask"}
+)
+_TRAIN_FORWARD_FIELDS = frozenset(
+    {"hidden", "input_ids", "position_ids", "attention_mask", "labels"}
+)
+_BACKWARD_FIELDS = frozenset({"grad_output"})
 _MAX_ID_LENGTH = 256
 _MAX_REQUEST_INPUT_BYTES = MAX_TENSOR_BYTES
 _MAX_PENDING_REQUESTS = 128
 _RPC_PING_INTERVAL_S = 30.0
 _RPC_PING_TIMEOUT_S = 300.0
+_TRAINING_SHAPE_KEYS = frozenset({"batch_size", "sequence_length"})
+
+
+def _normalize_training_config(
+    config: dict[str, Any],
+) -> tuple[dict[str, Any], LoRAConfig, int | None, int | None]:
+    """Validate and canonicalize the recipe accepted by the stage server."""
+    if not isinstance(config, dict):
+        raise ValueError("training_config must be a mapping")
+    unknown = set(config) - {
+        "lora",
+        "learning_rate",
+        "weight_decay",
+        "activation_checkpointing",
+        *tuple(_TRAINING_SHAPE_KEYS),
+    }
+    if unknown:
+        raise ValueError(f"unknown training config fields: {sorted(unknown)}")
+
+    lora_cfg = LoRAConfig.from_dict(config.get("lora"))
+    learning_rate = config.get("learning_rate")
+    if (
+        isinstance(learning_rate, bool)
+        or not isinstance(learning_rate, (int, float))
+        or not math.isfinite(float(learning_rate))
+        or float(learning_rate) <= 0
+    ):
+        raise ValueError("training learning_rate must be finite and positive")
+    weight_decay = config.get("weight_decay", 0.0)
+    if (
+        isinstance(weight_decay, bool)
+        or not isinstance(weight_decay, (int, float))
+        or not math.isfinite(float(weight_decay))
+        or float(weight_decay) < 0
+    ):
+        raise ValueError("training weight_decay must be finite and non-negative")
+    activation_checkpointing = config.get("activation_checkpointing", False)
+    if not isinstance(activation_checkpointing, bool):
+        raise ValueError("training activation_checkpointing must be boolean")
+
+    shape_values: dict[str, int | None] = {}
+    for name in _TRAINING_SHAPE_KEYS:
+        value = config.get(name)
+        if value is not None and (
+            isinstance(value, bool) or not isinstance(value, int) or value < 1
+        ):
+            raise ValueError(
+                f"training {name} must be a positive integer when provided"
+            )
+        shape_values[name] = value
+    batch_size = shape_values["batch_size"]
+    sequence_length = shape_values["sequence_length"]
+    if (batch_size is None) != (sequence_length is None):
+        raise ValueError(
+            "training batch_size and sequence_length must be provided together"
+        )
+
+    normalized: dict[str, Any] = {
+        "lora": lora_cfg.to_dict(),
+        "learning_rate": float(learning_rate),
+        "weight_decay": float(weight_decay),
+        "activation_checkpointing": activation_checkpointing,
+    }
+    if batch_size is not None:
+        normalized["batch_size"] = batch_size
+        normalized["sequence_length"] = sequence_length
+    return normalized, lora_cfg, batch_size, sequence_length
+
+
+def _training_recipe(config: dict[str, Any]) -> dict[str, Any]:
+    """Return recipe identity without the optional runtime batch shape."""
+    return {
+        key: value for key, value in config.items() if key not in _TRAINING_SHAPE_KEYS
+    }
+
+
+def _batch_sequence_from_tensor(tensor: torch.Tensor, name: str) -> tuple[int, int]:
+    """Read ``[batch, sequence, ...]`` without assuming the hidden width."""
+    if not isinstance(tensor, torch.Tensor) or tensor.ndim < 2:
+        raise ValueError(f"training {name} must have shape [batch, sequence, ...]")
+    batch_size = int(tensor.shape[0])
+    sequence_length = int(tensor.shape[1])
+    if batch_size < 1 or sequence_length < 1:
+        raise ValueError(f"training {name} must have positive batch and sequence")
+    return batch_size, sequence_length
 
 
 @dataclass(frozen=True)
@@ -88,6 +202,7 @@ class _ServerRequest:
     cache_key: str | None
     fields: dict[str, str]
     length: int = 0
+    params: dict[str, Any] = field(default_factory=dict)
     tensors: dict[str, tuple[TensorMeta, bytes]] = field(default_factory=dict)
     dispatched: bool = False
 
@@ -204,8 +319,18 @@ class StageRpcClient:
         vocab_size: int | None = None,
         max_position_embeddings: int | None = None,
     ) -> None:
-        if not math.isfinite(request_timeout_s) or request_timeout_s <= 0:
+        if (
+            isinstance(request_timeout_s, bool)
+            or not isinstance(request_timeout_s, (int, float))
+            or not math.isfinite(float(request_timeout_s))
+            or request_timeout_s <= 0
+        ):
             raise ValueError("request_timeout_s must be positive")
+        _validate_optional_positive_int(vocab_size, "vocab_size")
+        _validate_optional_positive_int(
+            max_position_embeddings,
+            "max_position_embeddings",
+        )
         self._ws = ws
         self._data = data
         self._pending: dict[str, _PendingRequest] = {}
@@ -237,12 +362,26 @@ class StageRpcClient:
         vocab_size: int | None = None,
         max_position_embeddings: int | None = None,
     ) -> StageRpcClient:
-        if not url:
+        if not isinstance(url, str) or not url:
             raise ValueError("stage RPC url must not be empty")
-        if not credential:
+        if not isinstance(credential, str) or not credential:
             raise ValueError("stage RPC credential must not be empty")
-        if relay_token == "":
+        if relay_token is not None and (
+            not isinstance(relay_token, str) or not relay_token
+        ):
             raise ValueError("relay_token must be non-empty or None")
+        if (
+            isinstance(request_timeout_s, bool)
+            or not isinstance(request_timeout_s, (int, float))
+            or not math.isfinite(float(request_timeout_s))
+            or request_timeout_s <= 0
+        ):
+            raise ValueError("request_timeout_s must be positive")
+        _validate_optional_positive_int(vocab_size, "vocab_size")
+        _validate_optional_positive_int(
+            max_position_embeddings,
+            "max_position_embeddings",
+        )
         from urllib.parse import urlparse
 
         parsed_url = urlparse(url)
@@ -320,6 +459,196 @@ class StageRpcClient:
             attempt_id=str(control["attempt_id"]),
             output=_tensor_from_wire(*output),
             kv_caches=[],
+        )
+
+    async def configure_training(
+        self,
+        lora_config: LoRAConfig | dict[str, Any],
+        *,
+        learning_rate: float,
+        weight_decay: float = 0.0,
+        activation_checkpointing: bool = False,
+        batch_size: int | None = None,
+        sequence_length: int | None = None,
+    ) -> dict[str, Any]:
+        """Prepare the remote stage's LoRA modules and optimizer.
+
+        Configuration is idempotent for an identical request.  A different
+        recipe is rejected while a worker is serving this RPC endpoint; a
+        caller must restart the stage or explicitly implement a checkpointed
+        reconfiguration instead of silently discarding optimizer state.
+        """
+        if isinstance(lora_config, LoRAConfig):
+            serialized = lora_config.to_dict()
+        elif isinstance(lora_config, dict):
+            serialized = LoRAConfig.from_dict(lora_config).to_dict()
+        else:
+            raise TypeError("lora_config must be LoRAConfig or a mapping")
+        if (
+            isinstance(learning_rate, bool)
+            or not isinstance(learning_rate, (int, float))
+            or not math.isfinite(float(learning_rate))
+            or learning_rate <= 0
+        ):
+            raise ValueError("learning_rate must be finite and positive")
+        if (
+            isinstance(weight_decay, bool)
+            or not isinstance(weight_decay, (int, float))
+            or not math.isfinite(float(weight_decay))
+            or weight_decay < 0
+        ):
+            raise ValueError("weight_decay must be finite and non-negative")
+        if not isinstance(activation_checkpointing, bool):
+            raise TypeError("activation_checkpointing must be boolean")
+        for name, value in (
+            ("batch_size", batch_size),
+            ("sequence_length", sequence_length),
+        ):
+            if value is not None and (
+                isinstance(value, bool) or not isinstance(value, int) or value < 1
+            ):
+                raise ValueError(f"{name} must be a positive integer or None")
+        if (batch_size is None) != (sequence_length is None):
+            raise ValueError("batch_size and sequence_length must be provided together")
+        training_config: dict[str, Any] = {
+            "lora": serialized,
+            "learning_rate": float(learning_rate),
+            "weight_decay": float(weight_decay),
+            "activation_checkpointing": activation_checkpointing,
+        }
+        if batch_size is not None:
+            training_config["batch_size"] = batch_size
+        if sequence_length is not None:
+            training_config["sequence_length"] = sequence_length
+        control, _ = await self._request(
+            method="configure_training",
+            operation_id=0,
+            attempt_id="training-config",
+            extra={
+                "training_config": training_config
+            },
+        )
+        return control
+
+    async def forward_train(
+        self,
+        hidden: torch.Tensor | None,
+        *,
+        input_ids: torch.Tensor | None = None,
+        position_ids: torch.Tensor | None = None,
+        attention_mask: torch.Tensor | None = None,
+        labels: torch.Tensor | None = None,
+        operation_id: int,
+        attempt_id: str,
+        ignore_index: int = -100,
+        loss_normalizer: int | None = None,
+    ) -> TrainForwardResult:
+        """Run a training forward and, on the final stage, construct its loss.
+
+        The final stage deliberately omits the logits tensor from the response.
+        Its scalar loss is enough to report metrics while the worker retains
+        the graph for the subsequent ``backward_train`` call.
+        """
+        tensors = {
+            name: tensor
+            for name, tensor in {
+                "hidden": hidden,
+                "input_ids": input_ids,
+                "position_ids": position_ids,
+                "attention_mask": attention_mask,
+                "labels": labels,
+            }.items()
+            if tensor is not None
+        }
+        extra: dict[str, Any] = {"ignore_index": ignore_index}
+        if loss_normalizer is not None:
+            extra["loss_normalizer"] = loss_normalizer
+        control, output = await self._request(
+            method="forward_train",
+            operation_id=operation_id,
+            attempt_id=attempt_id,
+            tensors=tensors,
+            extra=extra,
+        )
+        is_last = bool(control.get("is_last", False))
+        if not is_last and output is None:
+            raise RuntimeError("non-final training stage omitted hidden output")
+        return TrainForwardResult(
+            stage_id=int(control["stage_id"]),
+            operation_id=int(control["operation_id"]),
+            attempt_id=str(control["attempt_id"]),
+            output=_tensor_from_wire(*output) if output is not None else None,
+            loss=float(control["loss"]) if control.get("loss") is not None else None,
+            n_valid_tokens=int(control.get("n_valid_tokens", 0)),
+        )
+
+    async def backward_train(
+        self,
+        grad_output: torch.Tensor | None,
+        *,
+        operation_id: int,
+        attempt_id: str,
+    ) -> BackwardResult:
+        """Backpropagate a saved operation and return its boundary gradient."""
+        control, output = await self._request(
+            method="backward_train",
+            operation_id=operation_id,
+            attempt_id=attempt_id,
+            tensors={"grad_output": grad_output} if grad_output is not None else None,
+        )
+        return BackwardResult(
+            stage_id=int(control["stage_id"]),
+            operation_id=int(control["operation_id"]),
+            attempt_id=str(control["attempt_id"]),
+            grad_input=_tensor_from_wire(*output) if output is not None else None,
+        )
+
+    async def gradient_norm(self) -> float:
+        """Return this stage's local L2 norm before an optimizer boundary."""
+        control, _ = await self._request(
+            method="gradient_norm",
+            operation_id=0,
+            attempt_id="training-grad-norm",
+        )
+        value = float(control["grad_norm"])
+        if math.isnan(value) or value < 0:
+            raise RuntimeError(f"remote stage returned invalid gradient norm: {value}")
+        return value
+
+    async def optimizer_step(
+        self,
+        *,
+        clip_coef: float | None = None,
+        skip_update: bool = False,
+    ) -> bool:
+        """Apply the already accumulated gradients; return overflow status."""
+        if clip_coef is not None:
+            if not math.isfinite(clip_coef) or not 0 <= clip_coef <= 1:
+                raise ValueError("clip_coef must be finite and in [0, 1]")
+        if not isinstance(skip_update, bool):
+            raise TypeError("skip_update must be boolean")
+        control, _ = await self._request(
+            method="optimizer_step",
+            operation_id=0,
+            attempt_id="training-optimizer-step",
+            extra={"clip_coef": clip_coef, "skip_update": skip_update},
+        )
+        return bool(control.get("overflow", False))
+
+    async def reset_training(self) -> None:
+        """Restore the baseline captured at configure time and clear graphs."""
+        await self._request(
+            method="reset_training",
+            operation_id=0,
+            attempt_id="training-reset",
+        )
+
+    async def abort_training(self, operation_id: int, attempt_id: str) -> None:
+        """Discard one incomplete forward without resetting task adapters."""
+        await self._request(
+            method="abort_training",
+            operation_id=operation_id,
+            attempt_id=attempt_id,
         )
 
     async def clear_kv(self, cache_key: str | None = None) -> None:
@@ -417,6 +746,8 @@ class StageRpcClient:
                 meta, raw = _tensor_wire_parts(tensor, tensor_id)
                 field_ids[field_name] = tensor_id
                 wire_tensors.append((field_name, meta, raw))
+            if sum(len(raw) for _name, _meta, raw in wire_tensors) > _MAX_REQUEST_INPUT_BYTES:
+                raise ValueError("stage RPC request input exceeds byte limit")
 
             future = asyncio.get_running_loop().create_future()
             self._pending[request_id] = _PendingRequest(
@@ -535,7 +866,10 @@ class StageRpcClient:
                 self._drop_tensor_payloads(request_id)
                 continue
             output_id = response.get("output_tensor_id")
-            if pending.method == "forward_inference" and not isinstance(output_id, str):
+            needs_output = pending.method == "forward_inference" or (
+                pending.method == "forward_train" and response.get("is_last") is not True
+            )
+            if needs_output and not isinstance(output_id, str):
                 if not pending.future.done():
                     pending.future.set_exception(
                         RuntimeError("stage RPC forward response omitted output tensor ID")
@@ -589,11 +923,42 @@ class StageRpcServer:
         *,
         credential: str | None = None,
     ) -> None:
-        if credential == "":
+        if credential is not None and (
+            not isinstance(credential, str) or not credential
+        ):
             raise ValueError("stage RPC credential must be non-empty or None")
         self._worker = worker
         self._identity = identity
         self._credential = credential
+        self._training_lock = threading.RLock()
+        self._training_optimizer: torch.optim.Optimizer | None = None
+        self._training_config: dict[str, Any] | None = None
+        self._training_memory: dict[str, Any] | None = None
+        self._training_baseline: dict[str, torch.Tensor] | None = None
+        self._training_owner: str | None = None
+
+    def _forward_inference(
+        self,
+        tensors: dict[str, torch.Tensor],
+        request: _ServerRequest,
+    ) -> ForwardResult:
+        """Serialize inference with training and force dropout-free evaluation."""
+        with self._training_lock:
+            was_training = self._worker._model.training
+            self._worker._model.eval()
+            try:
+                return self._worker.forward_inference(
+                    tensors.get("hidden"),
+                    input_ids=tensors.get("input_ids"),
+                    position_ids=tensors.get("position_ids"),
+                    attention_mask=tensors.get("attention_mask"),
+                    operation_id=request.operation_id,
+                    attempt_id=request.attempt_id,
+                    reset_kv=request.reset_kv,
+                    cache_key=request.cache_key,
+                )
+            finally:
+                self._worker._model.train(was_training)
 
     async def serve_connection(self, ws: Any) -> None:
         if not self._authorized(ws):
@@ -608,6 +973,8 @@ class StageRpcServer:
         requests: dict[str, _ServerRequest] = {}
         tasks: set[asyncio.Task] = set()
         owned_cache_keys: set[str] = set()
+        owned_training_operations: set[int] = set()
+        connection_id = uuid.uuid4().hex
         # Cache names supplied by a client are labels, not global identities.
         # Namespace them per authenticated connection so two clients using
         # the same label cannot share or overwrite a StageWorker cache.
@@ -671,6 +1038,8 @@ class StageRpcServer:
             if request.method == "forward_inference":
                 assert request.cache_key is not None
                 owned_cache_keys.add(request.cache_key)
+            elif request.method == "forward_train":
+                owned_training_operations.add(request.operation_id)
             spawn(maybe_dispatch(request.request_id))
 
         def on_tensor(_operation_id: int, meta: TensorMeta, raw: bytes) -> None:
@@ -739,12 +1108,40 @@ class StageRpcServer:
                         send_lock,
                         request,
                         owned_cache_keys=owned_cache_keys,
+                        connection_id=connection_id,
                     )
                     if succeeded and request.method == "clear_kv":
                         if request.cache_key is not None:
                             owned_cache_keys.discard(request.cache_key)
                     elif succeeded and request.method == "clear_all_kv":
                         owned_cache_keys.clear()
+                    elif succeeded and request.method == "backward_train":
+                        owned_training_operations.discard(request.operation_id)
+                    elif succeeded and request.method == "abort_training":
+                        owned_training_operations.discard(request.operation_id)
+                    elif not succeeded and request.method in {
+                        "forward_train",
+                        "backward_train",
+                        "optimizer_step",
+                    }:
+                        # An execution error can happen after the stage has
+                        # created a graph or gradients but before the error
+                        # response reaches the client.  Drop that transient
+                        # state while the connection is still alive; waiting
+                        # for disconnect would let the next request retain a
+                        # stale graph and inflate VRAM.
+                        try:
+                            await _to_thread_drain_on_cancel(
+                                self._abort_training,
+                                request.operation_id,
+                                connection_id,
+                            )
+                        except Exception:
+                            log.exception(
+                                "could not clean failed training request %s",
+                                request.request_id,
+                            )
+                        owned_training_operations.discard(request.operation_id)
                 finally:
                     requests.pop(request_id, None)
 
@@ -759,6 +1156,9 @@ class StageRpcServer:
                 await asyncio.gather(*tasks, return_exceptions=True)
             for cache_key in owned_cache_keys:
                 self._worker.clear_kv(cache_key)
+            for operation_id in owned_training_operations:
+                self._worker.clear_saved(operation_id)
+            self._release_training_owner(connection_id)
 
     async def serve(
         self,
@@ -787,6 +1187,7 @@ class StageRpcServer:
         request: _ServerRequest,
         *,
         owned_cache_keys: set[str],
+        connection_id: str,
     ) -> bool:
         try:
             tensors = {
@@ -795,15 +1196,9 @@ class StageRpcServer:
             }
             if request.method == "forward_inference":
                 result = await _to_thread_drain_on_cancel(
-                    self._worker.forward_inference,
-                    tensors.get("hidden"),
-                    input_ids=tensors.get("input_ids"),
-                    position_ids=tensors.get("position_ids"),
-                    attention_mask=tensors.get("attention_mask"),
-                    operation_id=request.operation_id,
-                    attempt_id=request.attempt_id,
-                    reset_kv=request.reset_kv,
-                    cache_key=request.cache_key,
+                    self._forward_inference,
+                    tensors,
+                    request,
                 )
                 meta, raw = _tensor_wire_parts(
                     result.output, f"rpc:{request.request_id}:output"
@@ -818,7 +1213,118 @@ class StageRpcServer:
                         "attempt_id": result.attempt_id,
                         "output_tensor_id": meta.tensor_id,
                         "kv_length": self._worker.kv_cache_length(request.cache_key),
+                        "is_last": bool(self._worker._ctx.is_last),
                     })
+                return True
+            elif request.method == "configure_training":
+                summary = await _to_thread_drain_on_cancel(
+                    self._configure_training,
+                    request.params["training_config"],
+                    connection_id,
+                )
+                await self._send_ok(data, send_lock, request, **summary)
+                return True
+            elif request.method == "forward_train":
+                result = await _to_thread_drain_on_cancel(
+                    self._forward_train,
+                    tensors,
+                    request,
+                    connection_id,
+                )
+                output_tensor_id: str | None = None
+                output_meta: TensorMeta | None = None
+                output_raw: bytes | None = None
+                if result.output is not None:
+                    output_meta, output_raw = _tensor_wire_parts(
+                        result.output,
+                        f"rpc:{request.request_id}:output",
+                    )
+                    output_tensor_id = output_meta.tensor_id
+                async with send_lock:
+                    if output_meta is not None and output_raw is not None:
+                        await data.send_tensor(
+                            output_raw,
+                            output_meta,
+                            attempt_id=_frame_attempt(request.request_id),
+                        )
+                    response: dict[str, Any] = {
+                        "_type": _RPC_RESPONSE,
+                        "request_id": request.request_id,
+                        "stage_id": self._worker._ctx.stage_id,
+                        "operation_id": result.operation_id,
+                        "attempt_id": result.attempt_id,
+                        "is_last": bool(self._worker._ctx.is_last),
+                        "loss": result.loss,
+                        "n_valid_tokens": result.n_valid_tokens,
+                    }
+                    if output_tensor_id is not None:
+                        response["output_tensor_id"] = output_tensor_id
+                    await data.send_control(response)
+                return True
+            elif request.method == "backward_train":
+                result = await _to_thread_drain_on_cancel(
+                    self._backward_train,
+                    tensors.get("grad_output"),
+                    request,
+                    connection_id,
+                )
+                output_tensor_id: str | None = None
+                output_meta: TensorMeta | None = None
+                output_raw: bytes | None = None
+                if result.grad_input is not None:
+                    output_meta, output_raw = _tensor_wire_parts(
+                        result.grad_input,
+                        f"rpc:{request.request_id}:output",
+                    )
+                    output_tensor_id = output_meta.tensor_id
+                async with send_lock:
+                    if output_meta is not None and output_raw is not None:
+                        await data.send_tensor(
+                            output_raw,
+                            output_meta,
+                            attempt_id=_frame_attempt(request.request_id),
+                        )
+                    response = {
+                        "_type": _RPC_RESPONSE,
+                        "request_id": request.request_id,
+                        "stage_id": self._worker._ctx.stage_id,
+                        "operation_id": result.operation_id,
+                        "attempt_id": result.attempt_id,
+                    }
+                    if output_tensor_id is not None:
+                        response["output_tensor_id"] = output_tensor_id
+                    await data.send_control(response)
+                return True
+            elif request.method == "gradient_norm":
+                norm = await _to_thread_drain_on_cancel(
+                    self._gradient_norm,
+                    connection_id,
+                )
+                await self._send_ok(data, send_lock, request, grad_norm=norm)
+                return True
+            elif request.method == "optimizer_step":
+                overflow = await _to_thread_drain_on_cancel(
+                    self._optimizer_step,
+                    request.params.get("clip_coef"),
+                    bool(request.params.get("skip_update", False)),
+                    connection_id,
+                )
+                await self._send_ok(data, send_lock, request, overflow=overflow)
+                return True
+            elif request.method == "reset_training":
+                await _to_thread_drain_on_cancel(
+                    self._reset_training,
+                    connection_id,
+                )
+                await self._send_ok(data, send_lock, request)
+                return True
+            elif request.method == "abort_training":
+                await _to_thread_drain_on_cancel(
+                    self._abort_training,
+                    request.operation_id,
+                    connection_id,
+                )
+                await self._send_ok(data, send_lock, request)
                 return True
             elif request.method == "clear_kv":
                 await _to_thread_drain_on_cancel(
@@ -857,6 +1363,275 @@ class StageRpcServer:
             await self._send_error(data, send_lock, request.request_id, str(exc))
             return False
 
+    def _configure_training(
+        self,
+        config: dict[str, Any],
+        owner_id: str,
+    ) -> dict[str, Any]:
+        """Apply a validated recipe and create the stage-local optimizer."""
+        if _model_tied_embeddings(self._worker):
+            # A tied HF model has one logical endpoint parameter but a
+            # multi-stage portable deployment owns an embedding copy on stage
+            # 0 and an lm_head copy on the last stage.  Local training
+            # explicitly aggregates those gradients; the remote wire contract
+            # does not yet have the corresponding parameter-sync operation.
+            # Refuse before adapter/optimizer mutation rather than silently
+            # training two divergent endpoint copies.
+            raise RuntimeError(
+                "remote TTT does not support tied word embeddings; use an "
+                "untied artifact or local portable training"
+            )
+        normalized, lora_cfg, batch_size, sequence_length = _normalize_training_config(
+            config
+        )
+        with self._training_lock:
+            if self._training_owner is not None and self._training_owner != owner_id:
+                raise RuntimeError("stage training is already owned by another connection")
+            if self._training_optimizer is not None:
+                assert self._training_config is not None
+                if _training_recipe(normalized) != _training_recipe(self._training_config):
+                    raise RuntimeError(
+                        "stage is already configured with a different training recipe"
+                    )
+                if batch_size is not None:
+                    memory = check_training_memory(
+                        self._worker,
+                        lora_cfg,
+                        batch_size=batch_size,
+                        sequence_length=sequence_length,
+                        activation_checkpointing=bool(
+                            normalized["activation_checkpointing"]
+                        ),
+                        # Existing optimizer state is already resident and is
+                        # therefore included in live free VRAM.  The first
+                        # forward still needs fresh gradients/activations.
+                        optimizer_state_needed=not bool(self._training_optimizer.state),
+                        new_adapter_storage_needed=False,
+                    )
+                    if not memory.feasible:
+                        raise RuntimeError(memory.reason)
+                    self._training_memory = memory.as_dict()
+                    self._training_config["batch_size"] = batch_size
+                    self._training_config["sequence_length"] = sequence_length
+                self._training_owner = owner_id
+                return self._training_summary()
+
+            # This check intentionally happens before apply_lora and before
+            # AdamW creates any state.  A rejected rank-256 endpoint recipe
+            # must leave the stage untouched so a caller can retry safely.
+            static_memory = check_training_memory(
+                self._worker,
+                lora_cfg,
+                batch_size=batch_size,
+                sequence_length=sequence_length,
+                activation_checkpointing=bool(normalized["activation_checkpointing"]),
+                optimizer_state_needed=True,
+                new_adapter_storage_needed=True,
+            )
+            if not static_memory.feasible:
+                raise RuntimeError(static_memory.reason)
+
+            apply_lora(self._worker._model, lora_cfg)
+            if hasattr(self._worker._model, "activation_checkpointing"):
+                self._worker._model.activation_checkpointing = bool(
+                    normalized["activation_checkpointing"]
+                )
+            self._worker._model.train()
+            parameters = trainable_parameters(self._worker._model)
+            if not parameters:
+                raise ValueError("stage has no trainable parameters after LoRA injection")
+            self._training_optimizer = torch.optim.AdamW(
+                parameters,
+                lr=float(normalized["learning_rate"]),
+                weight_decay=float(normalized["weight_decay"]),
+            )
+            self._training_config = normalized
+            self._training_memory = static_memory.as_dict()
+            self._training_baseline = {
+                name: value.detach().cpu().clone()
+                for name, value in lora_state_dict(self._worker._model).items()
+            }
+            self._training_owner = owner_id
+            return self._training_summary()
+
+    def _require_training_owner(self, owner_id: str) -> None:
+        if self._training_optimizer is None:
+            raise RuntimeError("configure_training must be called first")
+        if self._training_owner != owner_id:
+            raise RuntimeError("stage training is owned by another connection")
+
+    def _training_summary(self) -> dict[str, Any]:
+        if self._training_optimizer is None or self._training_config is None:
+            raise RuntimeError("stage training is not configured")
+        return {
+            "training_config": self._training_config,
+            "memory": dict(self._training_memory or {}),
+            "trainable_parameters": sum(
+                parameter.numel()
+                for parameter in self._worker._model.parameters()
+                if parameter.requires_grad
+            ),
+            "is_last": bool(self._worker._ctx.is_last),
+            "tied_embeddings": _model_tied_embeddings(self._worker),
+        }
+
+    def _forward_train(
+        self,
+        tensors: dict[str, torch.Tensor],
+        request: _ServerRequest,
+        owner_id: str,
+    ) -> TrainForwardResult:
+        with self._training_lock:
+            self._require_training_owner(owner_id)
+            assert self._training_config is not None
+            shape_tensor = (
+                tensors.get("input_ids")
+                if self._worker._ctx.is_first
+                else tensors.get("hidden")
+            )
+            batch_size, sequence_length = _batch_sequence_from_tensor(
+                shape_tensor,
+                "input_ids" if self._worker._ctx.is_first else "hidden",
+            )
+            memory = check_training_memory(
+                self._worker,
+                LoRAConfig.from_dict(self._training_config["lora"]),
+                batch_size=batch_size,
+                sequence_length=sequence_length,
+                activation_checkpointing=bool(
+                    self._training_config["activation_checkpointing"]
+                ),
+                # AdamW state is lazy.  Once it exists, it is already part of
+                # the live free-memory reading; before that first allocation
+                # the guard must reserve it explicitly.
+                optimizer_state_needed=not bool(self._training_optimizer.state),
+                new_adapter_storage_needed=False,
+            )
+            if not memory.feasible:
+                raise RuntimeError(memory.reason)
+            result = self._worker.forward_train(
+                tensors.get("hidden"),
+                input_ids=tensors.get("input_ids"),
+                position_ids=tensors.get("position_ids"),
+                attention_mask=tensors.get("attention_mask"),
+                operation_id=request.operation_id,
+                attempt_id=request.attempt_id,
+            )
+            loss: float | None = None
+            n_valid = 0
+            labels = tensors.get("labels")
+            if self._worker._ctx.is_last:
+                if labels is None:
+                    self._worker.clear_saved(request.operation_id)
+                    raise ValueError("the final training stage requires labels")
+                loss, n_valid = self._worker.prepare_training_loss(
+                    operation_id=request.operation_id,
+                    labels=labels,
+                    ignore_index=int(request.params.get("ignore_index", -100)),
+                    loss_normalizer=request.params.get("loss_normalizer"),
+                )
+                output = None
+            else:
+                if labels is not None:
+                    self._worker.clear_saved(request.operation_id)
+                    raise ValueError("labels may only be sent to the final stage")
+                output = result.output
+            return TrainForwardResult(
+                stage_id=result.stage_id,
+                operation_id=result.operation_id,
+                attempt_id=result.attempt_id,
+                output=output,
+                loss=loss,
+                n_valid_tokens=n_valid,
+            )
+
+    def _backward_train(
+        self,
+        grad_output: torch.Tensor | None,
+        request: _ServerRequest,
+        owner_id: str,
+    ) -> BackwardResult:
+        with self._training_lock:
+            self._require_training_owner(owner_id)
+            return self._worker.backward_train(
+                grad_output,
+                operation_id=request.operation_id,
+                attempt_id=request.attempt_id,
+            )
+
+    def _gradient_norm(self, owner_id: str) -> float:
+        with self._training_lock:
+            self._require_training_owner(owner_id)
+            squared = 0.0
+            for parameter in trainable_parameters(self._worker._model):
+                if parameter.grad is None:
+                    continue
+                value = float(torch.linalg.vector_norm(parameter.grad.detach().float()).item())
+                if not math.isfinite(value):
+                    return math.inf
+                squared += value * value
+            return math.sqrt(squared)
+
+    def _optimizer_step(
+        self,
+        clip_coef: float | None,
+        skip_update: bool,
+        owner_id: str,
+    ) -> bool:
+        with self._training_lock:
+            self._require_training_owner(owner_id)
+            gradients = [
+                parameter.grad
+                for parameter in trainable_parameters(self._worker._model)
+                if parameter.grad is not None
+            ]
+            overflow = any(not bool(torch.isfinite(grad).all()) for grad in gradients)
+            if skip_update:
+                self._training_optimizer.zero_grad(set_to_none=True)
+                return True
+            if overflow:
+                self._training_optimizer.zero_grad(set_to_none=True)
+                return True
+            if clip_coef is not None:
+                if not math.isfinite(float(clip_coef)) or not 0 <= float(clip_coef) <= 1:
+                    raise ValueError("clip_coef must be finite and in [0, 1]")
+                if clip_coef < 1:
+                    for grad in gradients:
+                        grad.mul_(float(clip_coef))
+            self._training_optimizer.step()
+            self._training_optimizer.zero_grad(set_to_none=True)
+            return False
+
+    def _abort_training(self, operation_id: int, owner_id: str) -> None:
+        with self._training_lock:
+            self._require_training_owner(owner_id)
+            self._worker.clear_saved(operation_id)
+            self._worker.clear_kv()
+            if self._training_optimizer is not None:
+                self._training_optimizer.zero_grad(set_to_none=True)
+
+    def _reset_training(self, owner_id: str) -> None:
+        with self._training_lock:
+            self._require_training_owner(owner_id)
+            if self._training_baseline is None:
+                return
+            load_lora_state_dict(self._worker._model, self._training_baseline)
+            self._training_optimizer.state.clear()
+            self._training_optimizer.zero_grad(set_to_none=True)
+            self._worker.clear_saved()
+            self._worker.clear_all_kv()
+
+    def _release_training_owner(self, owner_id: str) -> None:
+        with self._training_lock:
+            if self._training_owner == owner_id:
+                # A disconnected client may have left a partial graph or
+                # gradient behind.  Drop transient state, but retain the
+                # adapter so a deliberate reconnect can continue or reset it.
+                self._worker.clear_saved()
+                if self._training_optimizer is not None:
+                    self._training_optimizer.zero_grad(set_to_none=True)
+                self._training_owner = None
+
     async def _send_ok(
         self,
         data: DataConn,
@@ -871,6 +1646,7 @@ class StageRpcServer:
                 "stage_id": self._worker._ctx.stage_id,
                 "operation_id": request.operation_id,
                 "attempt_id": request.attempt_id,
+                "is_last": bool(self._worker._ctx.is_last),
                 **extra,
             })
 
@@ -917,6 +1693,13 @@ def _parse_request(message: dict[str, Any]) -> _ServerRequest:
         raise ValueError("invalid request_id")
     if method not in {
         "forward_inference",
+        "configure_training",
+        "forward_train",
+        "backward_train",
+        "gradient_norm",
+        "optimizer_step",
+        "reset_training",
+        "abort_training",
         "clear_kv",
         "clear_all_kv",
         "kv_cache_length",
@@ -971,8 +1754,78 @@ def _parse_request(message: dict[str, Any]) -> _ServerRequest:
         raise ValueError("length must be non-negative")
     if request.length > _MAX_REQUEST_INPUT_BYTES:
         raise ValueError("stage RPC request input exceeds byte limit")
-    if method != "forward_inference" and normalized_fields:
-        raise ValueError(f"method {method!r} does not accept tensor fields")
+
+    allowed_fields = {
+        "forward_inference": _INFERENCE_FIELDS,
+        "forward_train": _TRAIN_FORWARD_FIELDS,
+        "backward_train": _BACKWARD_FIELDS,
+    }.get(method, frozenset())
+    unsupported_fields = set(normalized_fields) - allowed_fields
+    if unsupported_fields:
+        raise ValueError(
+            f"method {method!r} does not accept tensor fields: "
+            f"{sorted(unsupported_fields)}"
+        )
+
+    base_keys = {
+        "_type",
+        "request_id",
+        "method",
+        "operation_id",
+        "attempt_id",
+        "reset_kv",
+        "cache_key",
+        "tensors",
+    }
+    method_extra_keys = {
+        "trim_kv": {"length"},
+        "configure_training": {"training_config"},
+        "forward_train": {"ignore_index", "loss_normalizer"},
+        "optimizer_step": {"clip_coef", "skip_update"},
+    }.get(method, set())
+    unknown_keys = set(message) - base_keys - method_extra_keys
+    if unknown_keys:
+        raise ValueError(
+            f"unsupported fields for stage RPC method {method!r}: "
+            f"{sorted(unknown_keys)}"
+        )
+
+    params: dict[str, Any] = {}
+    if method == "configure_training":
+        training_config = message.get("training_config")
+        if not isinstance(training_config, dict):
+            raise ValueError("training_config must be a mapping")
+        params["training_config"] = training_config
+    elif method == "forward_train":
+        ignore_index = message.get("ignore_index", -100)
+        if isinstance(ignore_index, bool) or not isinstance(ignore_index, int):
+            raise ValueError("ignore_index must be an integer")
+        loss_normalizer = message.get("loss_normalizer")
+        if loss_normalizer is not None and (
+            isinstance(loss_normalizer, bool)
+            or not isinstance(loss_normalizer, int)
+            or loss_normalizer < 1
+        ):
+            raise ValueError("loss_normalizer must be a positive integer")
+        params.update(
+            ignore_index=ignore_index,
+            loss_normalizer=loss_normalizer,
+        )
+    elif method == "optimizer_step":
+        clip_coef = message.get("clip_coef")
+        if clip_coef is not None and (
+            isinstance(clip_coef, bool)
+            or not isinstance(clip_coef, (int, float))
+            or not math.isfinite(float(clip_coef))
+            or not 0 <= float(clip_coef) <= 1
+        ):
+            raise ValueError("clip_coef must be finite and in [0, 1]")
+        params["clip_coef"] = None if clip_coef is None else float(clip_coef)
+        skip_update = message.get("skip_update", False)
+        if not isinstance(skip_update, bool):
+            raise ValueError("skip_update must be boolean")
+        params["skip_update"] = skip_update
+    request.params = params
     return request
 
 
@@ -993,6 +1846,30 @@ def _validate_uint(name: str, value: int, bits: int) -> None:
         raise ValueError(f"{name} must be an integer")
     if not 0 <= value < (1 << bits):
         raise ValueError(f"{name} must fit in an unsigned {bits}-bit field")
+
+
+def _validate_optional_positive_int(value: int | None, name: str) -> None:
+    if value is not None and (
+        isinstance(value, bool) or not isinstance(value, int) or value < 1
+    ):
+        raise ValueError(f"{name} must be a positive integer or None")
+
+
+def _model_tied_embeddings(worker: StageWorker) -> bool:
+    """Read the model's tied-endpoint contract without assuming one config type."""
+    for owner in (
+        getattr(worker, "_model", None),
+        getattr(getattr(worker, "_model", None), "cfg", None),
+        getattr(getattr(worker, "_model", None), "config", None),
+    ):
+        if owner is None:
+            continue
+        value = getattr(owner, "tie_word_embeddings", None)
+        if value is not None:
+            if not isinstance(value, bool):
+                raise RuntimeError("model tie_word_embeddings metadata must be boolean")
+            return value
+    return False
 
 
 async def connect_stage_clients(

@@ -7,6 +7,8 @@ from dataclasses import asdict
 from pathlib import Path
 from typing import Any, cast
 
+import torch
+
 from meshgpu.planner.placement import (
     InferenceWorkload,
     ModelSpec,
@@ -289,19 +291,22 @@ def model_spec_from_manifest(
     )
 
 
-def lora_param_count_from_manifest(
+def lora_param_breakdown_from_manifest(
     manifest_or_dir: Any,
     rank: int,
     *,
     target_modules: tuple[str, ...] = ("q_proj", "v_proj"),
+    modules_to_save: tuple[str, ...] = (),
     artifact_root: str | Path | None = None,
-) -> int:
-    """Count the adapter parameters that ``apply_lora`` will inject.
+) -> dict[str, int]:
+    """Count adapter parameters and keep endpoint modules attached to stages.
 
     The count is obtained from the actual projection shapes in the artifact,
     so GQA and official Qwen blocks are handled without hard-coded output
     dimensions.  Missing or malformed targets fail closed instead of letting
-    a training preflight under-estimate optimizer memory.
+    a training preflight under-estimate optimizer memory.  ``other`` contains
+    full saved modules that are neither decoder-layer nor embedding/head
+    modules; callers that cannot represent those modules must reject them.
     """
     from meshgpu.artifacts.manifest import ModelManifest
 
@@ -310,6 +315,9 @@ def lora_param_count_from_manifest(
     targets = tuple(dict.fromkeys(target_modules))
     if not targets or any(not isinstance(name, str) or not name for name in targets):
         raise ValueError("target_modules must contain non-empty strings")
+    saved_modules = tuple(dict.fromkeys(modules_to_save))
+    if any(not isinstance(name, str) or not name for name in saved_modules):
+        raise ValueError("modules_to_save must contain non-empty strings")
 
     if isinstance(manifest_or_dir, ModelManifest):
         manifest = manifest_or_dir
@@ -319,28 +327,54 @@ def lora_param_count_from_manifest(
         root = path if path.is_dir() else path.parent
         manifest = ModelManifest.load(root / "manifest.json")
 
+    # Load and verify each shard once.  Besides avoiding duplicate disk/hash
+    # work, keeping this snapshot makes every count in this function refer to
+    # exactly the same immutable artifact files.
+    shard_states = [
+        (shard, _load_verified_shard_tensors(root, shard))
+        for shard in manifest.shards
+    ]
+    layer_targets = tuple(
+        target for target in targets if not _is_endpoint_module_name(target)
+    )
+    endpoint_targets = tuple(
+        target for target in targets if _is_endpoint_module_name(target)
+    )
+
     per_layer: dict[int, int] = {}
-    for shard in manifest.shards:
-        state = _load_verified_shard_tensors(root, shard)
-        if not isinstance(state, dict) or any(
-            not isinstance(key, str) for key in state
-        ):
-            raise ValueError(f"shard {shard.shard_id} must contain a string-keyed state dict")
+    for shard, state in shard_states:
         for local_index in range(shard.layer_end - shard.layer_start):
             global_index = shard.layer_start + local_index
             layer_total = 0
-            for target in targets:
-                key = f"layers.{local_index}.self_attn.{target}.weight"
-                tensor = state.get(key)
-                if tensor is None:
+            matched_weights: dict[str, Any] = {}
+            for target in layer_targets:
+                matches = [
+                    (key, tensor)
+                    for key, tensor in state.items()
+                    if _is_layer_target_weight(key, local_index, target)
+                ]
+                if not matches:
                     raise ValueError(
-                        f"artifact shard {shard.shard_id} is missing LoRA target {key!r}"
+                        f"artifact shard {shard.shard_id} is missing LoRA target "
+                        f"{target!r} in layer {local_index}"
                     )
-                if tensor.ndim != 2 or any(int(dim) < 1 for dim in tensor.shape):
+                for key, tensor in matches:
+                    # PEFT-style target aliases (for example ``q_proj`` and
+                    # ``self_attn.q_proj``) can resolve to the same module.
+                    # Count the module once, exactly as ``apply_lora`` does.
+                    matched_weights[key] = tensor
+            for key, tensor in matched_weights.items():
+                _validate_lora_weight(tensor, key)
+                module_path = key[: -len(".weight")]
+                if any(
+                    _matches_module_name(module_path, saved_name)
+                    for saved_name in saved_modules
+                ):
                     raise ValueError(
-                        f"LoRA target {key!r} must be a non-empty rank-2 weight"
+                        f"LoRA target {module_path!r} cannot also be listed in "
+                        "modules_to_save"
                     )
-                out_features, in_features = (int(tensor.shape[0]), int(tensor.shape[1]))
+                out_features, in_features = int(tensor.shape[0]), int(tensor.shape[1])
                 layer_total += rank * (in_features + out_features)
             if global_index in per_layer:
                 raise ValueError(f"duplicate artifact layer {global_index}")
@@ -354,7 +388,156 @@ def lora_param_count_from_manifest(
             "artifact layers do not cover the model for LoRA counting: "
             f"missing={missing}, extra={extra}"
         )
-    return sum(per_layer.values())
+    layer_total = sum(per_layer.values())
+    total = layer_total
+    endpoint_counts = {"embedding": 0, "lm_head": 0, "other": 0}
+    matched_endpoint_weights: dict[str, Any] = {}
+    for target in endpoint_targets:
+        matches = [
+            (key, tensor)
+            for _shard, state in shard_states
+            for key, tensor in state.items()
+            if _is_endpoint_target_weight(key, target)
+        ]
+        if not matches:
+            raise ValueError(
+                f"artifact does not contain LoRA endpoint target {target!r}"
+            )
+        for key, tensor in matches:
+            # As above, aliases must not count one endpoint twice.
+            matched_endpoint_weights[key] = tensor
+    for key, tensor in matched_endpoint_weights.items():
+        _validate_lora_weight(tensor, key)
+        module_path = key[: -len(".weight")]
+        if any(
+            _matches_module_name(module_path, saved_name)
+            for saved_name in saved_modules
+        ):
+            raise ValueError(
+                f"LoRA target {module_path!r} cannot also be listed in "
+                "modules_to_save"
+            )
+        out_features, in_features = int(tensor.shape[0]), int(tensor.shape[1])
+        count = rank * (in_features + out_features)
+        total += count
+        if _matches_module_name(module_path, "embed_tokens"):
+            endpoint_counts["embedding"] += count
+        elif _matches_module_name(module_path, "lm_head"):
+            endpoint_counts["lm_head"] += count
+        else:  # guarded by _is_endpoint_module_name, defensive only
+            endpoint_counts["other"] += count
+
+    if saved_modules:
+        for _shard, state in shard_states:
+            # apply_lora enables every parameter below each matching module,
+            # not just weight.  Build a union of matching module paths first
+            # so a module with a bias (or nested parameters) is counted once.
+            matched_module_paths: set[str] = set()
+            for key in state:
+                if not isinstance(key, str) or "." not in key:
+                    continue
+                module_path = key.rsplit(".", 1)[0]
+                if any(
+                    module_path == name or module_path.endswith("." + name)
+                    for name in saved_modules
+                ):
+                    matched_module_paths.add(module_path)
+            for key, tensor in state.items():
+                if not isinstance(key, str) or not isinstance(tensor, torch.Tensor):
+                    continue
+                parameter_path = key.rsplit(".", 1)[0] if "." in key else ""
+                matching_paths = [
+                    module_path
+                    for module_path in matched_module_paths
+                    if parameter_path == module_path
+                    or parameter_path.startswith(module_path + ".")
+                ]
+                if not matching_paths:
+                    continue
+                count = int(tensor.numel())
+                total += count
+                if any(_matches_module_name(path, "embed_tokens") for path in matching_paths):
+                    endpoint_counts["embedding"] += count
+                elif any(_matches_module_name(path, "lm_head") for path in matching_paths):
+                    endpoint_counts["lm_head"] += count
+                else:
+                    endpoint_counts["other"] += count
+        for saved_name in saved_modules:
+            if not any(
+                _matches_module_name(path, saved_name)
+                for _shard, state in shard_states
+                for path in _module_paths_with_parameters(state)
+            ):
+                raise ValueError(
+                    f"artifact does not contain modules_to_save target {saved_name!r}"
+                )
+    return {
+        "total": total,
+        "layer": layer_total,
+        **endpoint_counts,
+    }
+
+
+def lora_param_count_from_manifest(
+    manifest_or_dir: Any,
+    rank: int,
+    *,
+    target_modules: tuple[str, ...] = ("q_proj", "v_proj"),
+    modules_to_save: tuple[str, ...] = (),
+    artifact_root: str | Path | None = None,
+) -> int:
+    """Return the total adapter parameter count for compatibility callers."""
+    return lora_param_breakdown_from_manifest(
+        manifest_or_dir,
+        rank,
+        target_modules=target_modules,
+        modules_to_save=modules_to_save,
+        artifact_root=artifact_root,
+    )["total"]
+
+
+def _matches_module_name(path: str, name: str) -> bool:
+    return path == name or path.endswith("." + name)
+
+
+def _is_endpoint_module_name(name: str) -> bool:
+    return _matches_module_name(name, "embed_tokens") or _matches_module_name(
+        name, "lm_head"
+    )
+
+
+def _module_path_from_weight_key(key: Any) -> str | None:
+    if not isinstance(key, str) or not key.endswith(".weight"):
+        return None
+    return key[: -len(".weight")]
+
+
+def _is_layer_target_weight(key: Any, local_index: int, target: str) -> bool:
+    module_path = _module_path_from_weight_key(key)
+    if module_path is None:
+        return False
+    prefix = f"layers.{local_index}."
+    return module_path.startswith(prefix) and _matches_module_name(module_path, target)
+
+
+def _is_endpoint_target_weight(key: Any, target: str) -> bool:
+    module_path = _module_path_from_weight_key(key)
+    return module_path is not None and _matches_module_name(module_path, target)
+
+
+def _validate_lora_weight(tensor: Any, key: str) -> None:
+    if not isinstance(tensor, torch.Tensor):
+        raise ValueError(f"LoRA target {key!r} is not a tensor")
+    if tensor.ndim != 2 or any(int(dim) < 1 for dim in tensor.shape):
+        raise ValueError(f"LoRA target {key!r} must be a non-empty rank-2 weight")
+
+
+def _module_paths_with_parameters(state: dict[str, Any]) -> set[str]:
+    return {
+        module_path
+        for key in state
+        if (module_path := _module_path_from_weight_key(key)) is not None
+    }
 
 
 def _model_attention_from_manifest(manifest: Any, cfg: Any) -> str:

@@ -67,8 +67,13 @@ def _install_meshgpu() -> None:
                 for member in members:
                     if member.issym() or member.islnk():
                         raise RuntimeError("source archive must not contain symlinks")
-                target = (SOURCE_ROOT / member.name).resolve()
-                target.relative_to(root)
+                    target = (SOURCE_ROOT / member.name).resolve()
+                    try:
+                        target.relative_to(root)
+                    except ValueError as exc:
+                        raise RuntimeError(
+                            "source archive contains a path outside its extraction root"
+                        ) from exc
                 archive.extractall(SOURCE_ROOT)
     source_path = str(SOURCE_ROOT / "src")
     existing_pythonpath = os.environ.get("PYTHONPATH")

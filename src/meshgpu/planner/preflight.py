@@ -16,7 +16,7 @@ from typing import Any
 import torch
 
 from meshgpu.planner.job import (
-    lora_param_count_from_manifest,
+    lora_param_breakdown_from_manifest,
     model_spec_from_manifest,
 )
 from meshgpu.planner.memory import GiB
@@ -122,6 +122,7 @@ def plan_cuda_training_from_manifest(
     max_vram_fraction: float = 0.85,
     reserve_min_bytes: int = GiB,
     target_modules: tuple[str, ...] = ("q_proj", "v_proj"),
+    modules_to_save: tuple[str, ...] = (),
 ) -> PlacementReport:
     """Plan a local training launch before any stage weights reach a GPU.
 
@@ -141,15 +142,25 @@ def plan_cuda_training_from_manifest(
 
     model = model_spec_from_manifest(manifest_or_dir, artifact_root=artifact_root)
     if recipe == "lora":
-        adapter_count = lora_param_count_from_manifest(
+        breakdown = lora_param_breakdown_from_manifest(
             manifest_or_dir,
             lora_rank,
             target_modules=target_modules,
+            modules_to_save=modules_to_save,
             artifact_root=artifact_root,
         )
+        if breakdown["other"]:
+            raise ValueError(
+                "modules_to_save contains non-endpoint modules that the planner "
+                "cannot assign safely: "
+                f"{breakdown['other']} parameters"
+            )
         model = replace(
             model,
-            adapter_param_count=adapter_count,
+            adapter_param_count=breakdown["total"],
+            adapter_layer_param_count=breakdown["layer"],
+            adapter_embedding_param_count=breakdown["embedding"],
+            adapter_lm_head_param_count=breakdown["lm_head"],
             # LoRALinear deliberately owns fp32 Parameters regardless of the
             # frozen artifact's compute dtype.
             adapter_dtype_bytes=4,

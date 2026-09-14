@@ -31,10 +31,10 @@ từng request; `fine-tune` chạy full hoặc LoRA training với optimizer/che
 Thêm GPU trước hết giúp chứa resident weights và state của model lớn hơn, không tự
 đảm bảo latency hay throughput tăng tuyến tính.
 
-Stage inference RPC qua WebSocket/TLS cũng đã có API async để nối các stage ở process
-hoặc host khác. Nó dùng frame chunking, checksum, lease/incarnation validation và
-credit-based backpressure; training RPC chưa mở vì backward cần protocol activation/
-gradient riêng:
+Stage RPC qua WebSocket/TLS có API async để nối các stage ở process hoặc host khác.
+Nó dùng frame chunking, checksum, lease/incarnation validation và credit-based
+backpressure. Inference và explicit LoRA TTT đều dùng cùng endpoint; backward không
+đi xuyên autograd graph mà dùng activation/gradient protocol tường minh:
 
 ```python
 from meshgpu.backends.portable.pipeline import pipeline_prefill_async
@@ -51,6 +51,27 @@ stage = await StageRpcClient.connect(
 logits = await pipeline_prefill_async([stage], prompt_ids)
 await stage.close()
 ```
+
+Remote TTT giữ loss/logits và autograd graph tại stage cuối, chỉ gửi hidden state
+tiến và boundary gradient lùi. `remote-ttt` mặc định dùng NVARC-style
+`rank=256`, `alpha=32`, rsLoRA, bảy projection attention/MLP và lưu đầy đủ
+`embed_tokens`/`lm_head`; đây là đường experimental và cần một client độc quyền
+cho mỗi stage:
+
+```bash
+meshgpu remote-ttt \
+  --manifest ./artifacts/qwen3-4b-2s \
+  --stage-url "$STAGE0_URL" --stage-url "$STAGE1_URL" \
+  --credential "$STAGE0_SECRET" --credential "$STAGE1_SECRET" \
+  --relay-token "$RELAY_TOKEN" \
+  --stage-worker-incarnation 1001 --stage-worker-incarnation 1002 \
+  --client-incarnation 3001 --cluster-id 7 --job-id 4242 --lease-epoch 1 \
+  --batch ./data/one_task.json --steps 1
+```
+
+File batch là JSON thuần với `input_ids` và tùy chọn `labels`; gateway không đọc
+weights. Với ứng dụng nhiều task, dùng `RemoteTaskTTTSession` và gọi
+`reset_task()` giữa các task.
 
 Để chạy đúng mô hình “mỗi GPU là một stage process”, dùng `stage-server` trên từng
 máy. Mỗi process chỉ load shard được chọn, không load toàn bộ model:
@@ -126,12 +147,16 @@ stage_urls = [
 print(*stage_urls, sep="\n")
 ```
 
-Sau đó truyền hai URL này vào `meshgpu remote-serve`, kèm `--relay-token` (hoặc
+Sau đó truyền hai URL này vào `meshgpu remote-serve` (inference) hoặc
+`meshgpu remote-ttt` (TTT), kèm `--relay-token` (hoặc
 `MESHGPU_RELAY_TOKEN`) và credential tương ứng. Relay chỉ chuyển binary Stage-RPC; KV cache vẫn nằm ở
 đúng Kaggle session sở hữu layer. Đây là đường **experimental**: Kaggle phải bật
 Internet, phiên có thể bị thu hồi, và relay/controller phải nằm ngoài hai session.
-Training qua hai session chưa mở bằng Stage-RPC hiện tại vì backward/activation
-protocol cần một hợp đồng riêng; đường này trước mắt nghiệm thu inference.
+Remote TTT hiện là đường correctness/experimental: stage cuối tính loss và giữ
+autograd graph, còn gateway chỉ truyền activation/gradient boundary. Stage RPC có
+memory gate trước khi gắn adapter và trước mỗi forward; nó trả
+insufficient_memory thay vì cố chạy đến CUDA OOM. Nó chưa có checkpoint phân tán
+hay automatic recovery giữa chừng.
 
 Các template có sẵn trong `kaggle/meshgpu-stage0` và `kaggle/meshgpu-stage1`
 dùng Kaggle CUDA image cố định, lấy source từ dataset đã pin, và đọc runtime

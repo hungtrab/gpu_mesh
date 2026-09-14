@@ -33,18 +33,40 @@ class TaskTTTConfig:
     max_grad_norm: float = 1.0
     max_steps: int = 1
     optimizer: str = "adamw"
+    ignore_index: int = -100
+    activation_checkpointing: bool = False
 
     def __post_init__(self) -> None:
-        if not math.isfinite(self.learning_rate) or self.learning_rate <= 0:
+        if isinstance(self.learning_rate, bool) or not isinstance(
+            self.learning_rate, (int, float)
+        ):
+            raise TypeError("learning_rate must be numeric")
+        if not math.isfinite(float(self.learning_rate)) or self.learning_rate <= 0:
             raise ValueError("learning_rate must be finite and positive")
-        if not math.isfinite(self.weight_decay) or self.weight_decay < 0:
+        if isinstance(self.weight_decay, bool) or not isinstance(
+            self.weight_decay, (int, float)
+        ):
+            raise TypeError("weight_decay must be numeric")
+        if not math.isfinite(float(self.weight_decay)) or self.weight_decay < 0:
             raise ValueError("weight_decay must be finite and non-negative")
-        if not math.isfinite(self.max_grad_norm) or self.max_grad_norm <= 0:
+        if isinstance(self.max_grad_norm, bool) or not isinstance(
+            self.max_grad_norm, (int, float)
+        ):
+            raise TypeError("max_grad_norm must be numeric")
+        if not math.isfinite(float(self.max_grad_norm)) or self.max_grad_norm <= 0:
             raise ValueError("max_grad_norm must be finite and positive")
+        if isinstance(self.max_steps, bool) or not isinstance(self.max_steps, int):
+            raise TypeError("max_steps must be an integer")
         if self.max_steps < 1:
             raise ValueError("max_steps must be positive")
+        if not isinstance(self.optimizer, str):
+            raise TypeError("optimizer must be a string")
         if self.optimizer.lower() != "adamw":
             raise ValueError("TaskTTT currently supports only AdamW")
+        if isinstance(self.ignore_index, bool) or not isinstance(self.ignore_index, int):
+            raise TypeError("ignore_index must be an integer")
+        if not isinstance(self.activation_checkpointing, bool):
+            raise TypeError("activation_checkpointing must be boolean")
 
 
 class TaskTTTSession:
@@ -64,6 +86,9 @@ class TaskTTTSession:
             # it unconditionally so a partially restored stage cannot slip
             # through merely because one adapter parameter happens to exist.
             apply_lora(worker._model, self.cfg.lora)
+            if hasattr(worker._model, "activation_checkpointing"):
+                worker._model.activation_checkpointing = self.cfg.activation_checkpointing
+            worker._model.train()
         self._optimizers = [self._make_optimizer(worker) for worker in workers]
         self._baseline = [
             {
@@ -98,6 +123,7 @@ class TaskTTTSession:
                 self._optimizers,
                 operation_id=operation_id_start + step,
                 attempt_id=f"{attempt_prefix}_{self._task_steps + step}",
+                ignore_index=self.cfg.ignore_index,
                 max_grad_norm=self.cfg.max_grad_norm,
             )
             results.append(result)

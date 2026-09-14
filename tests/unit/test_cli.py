@@ -9,6 +9,7 @@ from click.testing import CliRunner
 from meshgpu.cli.main import (
     _build_remote_ssl_context,
     _expand_stage_options,
+    _load_remote_ttt_batch,
     cli,
 )
 
@@ -113,6 +114,37 @@ def test_remote_serve_help_exposes_metadata_only_gateway():
     assert "model weights" in result.output
     assert "--stage-url" in result.output
     assert "--relay-token" in result.output
+
+
+def test_remote_ttt_help_exposes_nvarc_defaults():
+    result = CliRunner().invoke(cli, ["remote-ttt", "--help"])
+
+    assert result.exit_code == 0, result.output
+    assert "remote stage workers" in result.output
+    assert "--lora-rank" in result.output
+    assert "--rslora" in result.output
+    assert "--modules-to-save" in result.output
+
+
+def test_remote_ttt_batch_loader_rejects_bad_labels_and_context(tmp_path):
+    batch = tmp_path / "batch.json"
+    batch.write_text(json.dumps({"input_ids": [[1, 2]], "labels": [[1, 99]]}))
+    with pytest.raises(ValueError, match="outside the manifest vocabulary"):
+        _load_remote_ttt_batch(
+            batch,
+            vocab_size=32,
+            max_position_embeddings=8,
+            ignore_index=-100,
+        )
+
+    batch.write_text(json.dumps({"input_ids": [[1, 2, 3]], "labels": [[1, 2, 3]]}))
+    with pytest.raises(ValueError, match="exceeds model context"):
+        _load_remote_ttt_batch(
+            batch,
+            vocab_size=32,
+            max_position_embeddings=2,
+            ignore_index=-100,
+        )
 
 
 def test_expand_stage_options_only_repeats_explicitly_allowed_values():

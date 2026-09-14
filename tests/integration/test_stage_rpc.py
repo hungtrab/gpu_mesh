@@ -87,6 +87,25 @@ async def test_stage_rpc_client_rejects_non_websocket_url_before_connecting():
         )
 
 
+@pytest.mark.asyncio
+async def test_stage_rpc_client_rejects_invalid_model_metadata_before_connecting():
+    identity = StageRpcIdentity(1, 1, 1, 1)
+    with pytest.raises(ValueError, match="vocab_size"):
+        await StageRpcClient.connect(
+            "ws://127.0.0.1:1",
+            "rpc-secret",
+            identity,
+            vocab_size=0,
+        )
+    with pytest.raises(ValueError, match="max_position_embeddings"):
+        await StageRpcClient.connect(
+            "ws://127.0.0.1:1",
+            "rpc-secret",
+            identity,
+            max_position_embeddings=True,
+        )
+
+
 def _tiny_cfg() -> LlamaConfig:
     return LlamaConfig(
         vocab_size=64,

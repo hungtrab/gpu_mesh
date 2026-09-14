@@ -75,6 +75,24 @@ class ForwardResult:
 
 
 @dataclass
+class TrainForwardResult:
+    """Wire-safe result for a training forward.
+
+    Non-final stages return a detached hidden state.  The final stage returns
+    only loss metadata: sending ``[batch, sequence, vocab]`` logits back to a
+    gateway would waste bandwidth and can itself recreate the memory problem
+    that sharding is meant to solve.
+    """
+
+    stage_id: int
+    operation_id: int
+    attempt_id: str
+    output: torch.Tensor | None
+    loss: float | None = None
+    n_valid_tokens: int = 0
+
+
+@dataclass
 class BackwardResult:
     stage_id: int
     operation_id: int
@@ -201,6 +219,8 @@ class StageWorker:
             "x": x,
             "out": out,
             "attempt_id": attempt_id,
+            "loss": None,
+            "n_valid_tokens": 0,
         }
         self._kv_caches = new_kv if new_kv is not None else []
 
@@ -212,6 +232,56 @@ class StageWorker:
             kv_caches=new_kv,
             _boundary_tensor=x if not self._ctx.is_first else None,
         )
+
+    def prepare_training_loss(
+        self,
+        *,
+        operation_id: int,
+        labels: torch.Tensor,
+        ignore_index: int = -100,
+        loss_normalizer: int | None = None,
+    ) -> tuple[float, int]:
+        """Attach a causal-LM loss to a saved final-stage graph.
+
+        The loss is created on the stage device and retained in ``_saved``.
+        ``backward_train(None, ...)`` then backpropagates this scalar.  Keeping
+        this operation on the worker is the key property that makes backward
+        over a network correct: autograd never has to cross a socket.
+        """
+        saved = self._saved.get(operation_id)
+        if saved is None:
+            raise RuntimeError(f"no saved state for operation_id={operation_id}")
+        if not self._ctx.is_last:
+            raise ValueError("only the last stage may compute the training loss")
+        if isinstance(ignore_index, bool) or not isinstance(ignore_index, int):
+            raise ValueError("ignore_index must be an integer")
+        if loss_normalizer is not None:
+            if (
+                isinstance(loss_normalizer, bool)
+                or not isinstance(loss_normalizer, int)
+                or loss_normalizer < 1
+            ):
+                raise ValueError("loss_normalizer must be a positive integer")
+
+        logits: torch.Tensor = saved["out"]
+        labels = labels.to(device=self._ctx.device, dtype=torch.long)
+        if labels.ndim != 2 or tuple(labels.shape) != tuple(logits.shape[:2]):
+            raise ValueError(
+                "labels must have shape [batch, sequence] matching stage logits; "
+                f"got {tuple(labels.shape)} vs {tuple(logits.shape[:2])}"
+            )
+        valid_mask = labels != ignore_index
+        n_valid = int(valid_mask.sum().item())
+        denominator = max(n_valid if loss_normalizer is None else loss_normalizer, 1)
+        loss = torch.nn.functional.cross_entropy(
+            logits.reshape(-1, logits.shape[-1]),
+            labels.reshape(-1),
+            ignore_index=ignore_index,
+            reduction="sum",
+        ) / denominator
+        saved["loss"] = loss
+        saved["n_valid_tokens"] = n_valid
+        return float(loss.detach().item()), n_valid
 
     # ------------------------------------------------------------------
     # Training backward
@@ -245,9 +315,17 @@ class StageWorker:
             grad_output = self._move_input(grad_output)
 
         try:
-            # Loss is computed at the last stage; for earlier stages
-            # ``grad_output`` is the gradient received from downstream.
-            out.backward(gradient=grad_output)
+            # The final stage stores a scalar loss in ``prepare_training_loss``;
+            # earlier stages receive dL/dout from the downstream boundary.
+            loss = saved.get("loss")
+            if grad_output is None and loss is not None:
+                loss.backward()
+            else:
+                if grad_output is None:
+                    raise ValueError(
+                        "grad_output is required for a non-final training stage"
+                    )
+                out.backward(gradient=grad_output)
 
             grad_input = None
             if not self._ctx.is_first and x.grad is not None:
@@ -337,8 +415,12 @@ class StageWorker:
                 trimmed.append((key[:, :, :length, :], value[:, :, :length, :]))
             self._set_kv(cache_key, trimmed)
 
-    def clear_saved(self) -> None:
-        self._saved.clear()
+    def clear_saved(self, operation_id: int | None = None) -> None:
+        """Drop one saved autograd graph, or all graphs during task reset."""
+        if operation_id is None:
+            self._saved.clear()
+        else:
+            self._saved.pop(operation_id, None)
 
     def _move_input(self, hidden: torch.Tensor | None) -> torch.Tensor:
         if hidden is None:

@@ -28,9 +28,9 @@ Các đường chạy hiện có:
 | --- | --- | --- |
 | Inference một máy, nhiều GPU | `serve --transport local_cuda` | Đường ưu tiên |
 | Inference process/host khác | `stage-server` hoặc `stage-worker` + RPC/relay | Đã có, cần benchmark |
-| Inference hai Kaggle session | Outbound WSS relay | Experimental, đã smoke-test với Qwen3-0.6B |
+| Inference hai Kaggle session | Outbound WSS relay | Experimental; CI mô phỏng topology, live Kaggle cần nghiệm thu riêng |
 | Fine-tune một máy, nhiều GPU | `fine-tune`, LoRA hoặc full | Đường chính hiện tại |
-| Fine-tune qua WAN/Kaggle worker | Stage-RPC backward | Chưa hỗ trợ |
+| Fine-tune qua WAN/Kaggle worker | Stage-RPC backward | Experimental; one in-flight TTT step |
 
 `local_cuda` chỉ dùng khi các stage ở cùng host. Stage ở host khác dùng `cpu`
 transport qua RPC; không gửi CUDA pointer qua network.
@@ -410,9 +410,50 @@ Kết quả nghiệm thu tối thiểu phải có:
 4. Decode trả token và KV length của hai stage bằng nhau.
 5. Sau khi request kết thúc, KV được clear hoặc release; không tăng vô hạn qua nhiều request.
 
-Đường Kaggle/WAN là experimental. Smoke-test Qwen3-0.6B hai session đã chạy được
-forward thật, nhưng latency relay có thể rất cao; không dùng kết quả smoke đó làm
-throughput claim.
+Đường Kaggle/WAN là experimental. Bộ integration test hiện mô phỏng đúng topology
+hai outbound session và đã kiểm tra forward qua relay với model nhỏ; đó chưa phải
+log của hai Kaggle kernel thật. Khi chạy Kaggle thật, phải ghi riêng model revision,
+precision, peak VRAM và latency relay; không dùng test mô phỏng làm throughput claim.
+
+### 5.5. TTT qua hai Kaggle session
+
+Hai `stage-worker` ở trên không cần đổi lệnh: sau khi source mới được cài, chúng
+nhận thêm `configure_training`, `forward_train`, `backward_train` và optimizer RPC.
+Gateway chạy một task TTT bằng JSON thuần (không tải model weights):
+
+```json
+{
+  "input_ids": [[1, 2, 3, 4]],
+  "labels": [[1, 2, 3, 4]]
+}
+```
+
+```bash
+meshgpu remote-ttt \
+  --manifest ./artifacts/qwen3-4b-2s \
+  --stage-url "${RELAY_BASE}?job_id=4242&stage_id=0&role=gateway" \
+  --stage-url "${RELAY_BASE}?job_id=4242&stage_id=1&role=gateway" \
+  --credential "$STAGE0_SECRET" --credential "$STAGE1_SECRET" \
+  --relay-token "$RELAY_TOKEN" \
+  --stage-worker-incarnation 1001 --stage-worker-incarnation 1002 \
+  --client-incarnation 3001 --cluster-id 7 --job-id 4242 --lease-epoch 1 \
+  --batch ./data/task.json --steps 1
+```
+
+Mặc định lệnh này dùng cấu hình NVARC-compatible: `rank=256`, `alpha=32`,
+rsLoRA, `q/k/v/o_proj` và `gate/up/down_proj`, cùng
+`embed_tokens,lm_head` trong `modules_to_save`; bật activation checkpointing.
+Có thể truyền `--lora-target-modules`, `--modules-to-save`, `--lora-rank` và
+`--lora-alpha` để khớp recipe khác. Stage cuối tính loss trên GPU của nó và
+không gửi logits về gateway. Mỗi lần gọi là một task bắt đầu từ state của worker;
+ứng dụng nhiều task nên dùng `RemoteTaskTTTSession` rồi gọi `reset_task()` giữa
+các puzzle. Artifact có `tie_word_embeddings=true` bị từ chối rõ ràng ở remote
+TTT vì wire contract hiện chưa truyền phép cộng gradient giữa embedding stage 0
+và lm_head stage cuối; dùng artifact untied hoặc training local cho trường hợp đó.
+
+Đây chưa phải TTT production: checkpoint/optimizer resume và failover giữa một
+optimizer step chưa được tự động hóa; nếu relay mất trong task, caller phải fail
+task và bắt đầu lại từ checkpoint hoặc baseline đã biết.
 
 ## 6. Người dùng: stage RPC trực tiếp
 
@@ -549,8 +590,9 @@ Agent training phải:
 4. checkpoint định kỳ, verify hash, chỉ resume từ committed pointer;
 5. sau training, export artifact inference và kiểm tra load lại.
 
-Stage-RPC hiện chỉ mở inference. Không khởi động `fine-tune` với hai Kaggle
-`stage-worker` rồi kỳ vọng backward tự đi qua socket.
+Với training hai Kaggle stage, dùng `remote-ttt` hoặc API
+`RemoteTaskTTTSession`; không dùng `fine-tune`, vì `fine-tune` là local-process
+trainer và cần tự sở hữu `StageWorker` cùng optimizer của mọi stage.
 
 ### Phase G — recovery và cleanup
 
@@ -676,6 +718,7 @@ meshgpu stage-server --help
 meshgpu stage-worker --help
 meshgpu relay-server --help
 meshgpu remote-serve --help
+meshgpu remote-ttt --help
 meshgpu benchmark --help
 ```
 

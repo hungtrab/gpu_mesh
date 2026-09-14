@@ -5,7 +5,10 @@ import torch
 from click.testing import CliRunner
 
 from meshgpu.cli.main import cli
-from meshgpu.planner.job import lora_param_count_from_manifest
+from meshgpu.planner.job import (
+    lora_param_breakdown_from_manifest,
+    lora_param_count_from_manifest,
+)
 from meshgpu.planner.placement import ModelSpec, _trainable_layer_params
 from meshgpu.planner.preflight import plan_cuda_training_from_manifest
 from tests.unit.test_hf_import import _save_shards, _tiny_cfg
@@ -36,6 +39,58 @@ def test_lora_count_uses_real_projection_shapes(tmp_path) -> None:
 
     # q and v are [out, in] = [16, 16] in this GQA fixture.
     assert lora_param_count_from_manifest(artifact, 4) == 4 * (32 + 32) * 4
+
+
+def test_lora_breakdown_keeps_modules_to_save_as_endpoints(tmp_path) -> None:
+    artifact = _save_shards(_tiny_cfg(), 2, tmp_path)
+    breakdown = lora_param_breakdown_from_manifest(
+        artifact,
+        4,
+        target_modules=(
+            "q_proj",
+            "k_proj",
+            "v_proj",
+            "o_proj",
+            "gate_proj",
+            "up_proj",
+            "down_proj",
+        ),
+        modules_to_save=("embed_tokens", "lm_head"),
+    )
+
+    assert breakdown["layer"] == 4 * 4 * (4 * 32 + 3 * 48)
+    assert breakdown["embedding"] == 64 * 16
+    assert breakdown["lm_head"] == 64 * 16
+    assert breakdown["other"] == 0
+    assert breakdown["total"] == (
+        breakdown["layer"] + breakdown["embedding"] + breakdown["lm_head"]
+    )
+
+
+def test_lora_breakdown_deduplicates_aliases_and_supports_endpoint_targets(tmp_path) -> None:
+    artifact = _save_shards(_tiny_cfg(), 2, tmp_path)
+
+    aliases = lora_param_breakdown_from_manifest(
+        artifact,
+        4,
+        target_modules=("q_proj", "self_attn.q_proj"),
+    )
+    one_target = lora_param_breakdown_from_manifest(
+        artifact,
+        4,
+        target_modules=("q_proj",),
+    )
+    assert aliases == one_target
+
+    endpoints = lora_param_breakdown_from_manifest(
+        artifact,
+        4,
+        target_modules=("embed_tokens", "lm_head"),
+    )
+    assert endpoints["layer"] == 0
+    assert endpoints["embedding"] == 4 * (64 + 16)
+    assert endpoints["lm_head"] == 4 * (64 + 16)
+    assert endpoints["other"] == 0
 
 
 def test_cuda_training_preflight_returns_loader_ranges(monkeypatch, tmp_path) -> None:

@@ -10,6 +10,7 @@ from meshgpu.planner.placement import (
     WorkerSpec,
     _inference_peak,
     _proportional_split,
+    _trainable_layer_params,
     _training_peak,
     plan_inference,
     plan_training,
@@ -185,6 +186,37 @@ def test_training_peak_reflects_activation_checkpointing():
     )
     assert with_checkpointing.workspace_bytes < without.workspace_bytes
     assert with_checkpointing.total < without.total
+
+
+def test_lora_endpoint_parameters_stay_on_endpoint_stages():
+    model = ModelSpec(
+        **{
+            **SMALL_MODEL.__dict__,
+            "adapter_param_count": 5_100,
+            "adapter_layer_param_count": 4_000,
+            "adapter_embedding_param_count": 1_000,
+            "adapter_lm_head_param_count": 100,
+        }
+    )
+
+    assert _trainable_layer_params(model, 2, is_first=True) == 3_000
+    assert _trainable_layer_params(model, 2, is_last=True) == 2_100
+    assert _trainable_layer_params(model, 2) == 2_000
+    first = _training_peak(
+        model,
+        TrainingWorkload(batch_size=1, sequence_length=8),
+        2,
+        is_first=True,
+        is_last=False,
+    )
+    interior = _training_peak(
+        model,
+        TrainingWorkload(batch_size=1, sequence_length=8),
+        2,
+        is_first=False,
+        is_last=False,
+    )
+    assert first.adapter_bytes - interior.adapter_bytes == 1_000 * 4
 
 
 def test_planner_rejects_context_budget_before_memory_placement():
