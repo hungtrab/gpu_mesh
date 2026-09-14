@@ -1,0 +1,47 @@
+# Local secrets and environment overrides
+.env
+.env.*
+.env_*
+!.env.example
+
+# Python caches and type-checker state
+__pycache__/
+*.py[cod]
+*$py.class
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+.hypothesis/
+.tox/
+.nox/
+
+# Coverage and test reports
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+pytest.xml
+
+# Packaging/build output
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# Local runtime state
+*.db
+*.sqlite
+*.sqlite3
+checkpoints/
+artifacts/
+
+# Generated archives, except the reproducible Kaggle smoke snapshot tracked here
+*.tar.gz
+!kaggle/meshgpu-source-20260914/meshgpu-kaggle-smoke.tar.gz
+
+# Editors and operating systems
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
