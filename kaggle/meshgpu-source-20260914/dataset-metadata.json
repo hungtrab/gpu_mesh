@@ -1,0 +1,11 @@
+{
+  "title": "MeshGPU source smoke 20260914",
+  "id": "bnhanh/meshgpu-source-20260914",
+  "subtitle": "Pinned MeshGPU source archive for a two-session WAN inference smoke test",
+  "description": "Source archive for a transient MeshGPU cross-session inference smoke test. It contains no credentials or model weights.",
+  "licenses": [
+    {
+      "name": "CC0-1.0"
+    }
+  ]
+}
